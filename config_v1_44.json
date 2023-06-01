@@ -7,7 +7,8 @@
     "adam_b2": 0.99,
     "lr_decay": 0.999,
     "seed": 1234,
-
+    "use_mpd": false,
+    
     "upsample_rates": [8,8],
     "upsample_kernel_sizes": [16,16],
     "upsample_initial_channel": 512,
@@ -29,6 +30,11 @@
     "fmax_for_loss": null,
 
     "num_workers": 4,
+    "d_filters" : 1,
+    "d_ffts": [4096, 2048, 1024, 512, 256],
+    "d_hop_sizes": [1024, 512, 256, 128, 64],
+    "d_win_lengths": [4096, 2048, 1024, 512, 256],
+    
 
     "dist_config": {
         "dist_backend": "nccl",

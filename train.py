@@ -18,7 +18,7 @@ from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator,
     discriminator_loss
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
 from stft import TorchSTFT
-
+from msstftd import MultiScaleSTFTDiscriminator
 torch.backends.cudnn.benchmark = False
 
 
@@ -31,10 +31,12 @@ def train(rank, a, h):
     device = torch.device('cuda:{:d}'.format(rank))
 
     generator = Generator(h).to(device)
-    mpd = MultiPeriodDiscriminator().to(device)
-    msd = MultiScaleDiscriminator().to(device)
+    if h.use_mpd:
+        mpd = MultiPeriodDiscriminator().to(device)
+
+    mstftd = MultiScaleSTFTDiscriminator(h.d_filters, 1, 1, h.d_ffts, h.d_hop_sizes, h.d_win_lengths).to(device)
     stft = TorchSTFT(filter_length=h.gen_istft_n_fft, hop_length=h.gen_istft_hop_size, win_length=h.gen_istft_n_fft).to(device)
-    stft.window = stft.window.to(device) #fix window being on cpu somehow
+    stft.window = stft.window.to(device)
 
     if rank == 0:
         print(generator)
@@ -61,8 +63,10 @@ def train(rank, a, h):
         state_dict_g = load_checkpoint(cp_g, device)
         state_dict_do = load_checkpoint(cp_do, device)
         generator.load_state_dict(state_dict_g['generator'])
-        mpd.load_state_dict(state_dict_do['mpd'])
-        msd.load_state_dict(state_dict_do['msd'])
+        if h.use_mpd:
+            mpd.load_state_dict(state_dict_do['mpd'])
+
+        mstftd.load_state_dict(state_dict_do['mstftd'])
         
         steps = state_dict_do['steps'] + 1
         last_epoch = state_dict_do['epoch']
@@ -74,11 +78,15 @@ def train(rank, a, h):
     if h.num_gpus > 1:
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
         mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
-        msd = DistributedDataParallel(msd, device_ids=[rank]).to(device)
+        mstftd = DistributedDataParallel(msd, device_ids=[rank]).to(device)
 
     optim_g = torch.optim.AdamW(generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
-    optim_d = torch.optim.AdamW(itertools.chain(msd.parameters(), mpd.parameters()),
+    if h.use_mpd:
+        optim_d = torch.optim.AdamW(itertools.chain(mstftd.parameters(), mpd.parameters()),
                                 h.learning_rate, betas=[h.adam_b1, h.adam_b2])
+    else:
+        optim_d = torch.optim.AdamW(mstftd.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
+    
 
     if state_dict_do is not None:
         optim_g.load_state_dict(state_dict_do['optim_g'])
@@ -116,8 +124,10 @@ def train(rank, a, h):
         sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
 
     generator.train()
-    mpd.train()
-    msd.train()
+    if h.use_mpd:
+        mpd.train()
+    
+    mstftd.train()
     for epoch in range(max(0, last_epoch), a.training_epochs):
         if rank == 0:
             start = time.time()
@@ -137,7 +147,6 @@ def train(rank, a, h):
             # y_g_hat = generator(x)
             spec, phase = generator(x)
 
-            spec, phase = spec.to(device), phase.to(device)
 
             y_g_hat = stft.inverse(spec, phase)
 
@@ -147,14 +156,20 @@ def train(rank, a, h):
             optim_d.zero_grad()
 
             # MPD
-            y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
-            loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
+            if h.use_mpd:
+                y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
+                loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
 
-            # MSD
-            y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
+            # MSTFTD
+            y_ds_hat_r, _ = mstftd(y)
+            y_ds_hat_g, _ = mstftd(y_g_hat.detach())
             loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
 
-            loss_disc_all = loss_disc_s + loss_disc_f
+           
+            
+            loss_disc_all = loss_disc_s
+            if h.use_mpd:
+                 loss_disc_all += loss_disc_f
 
             loss_disc_all.backward()
             optim_d.step()
@@ -164,14 +179,26 @@ def train(rank, a, h):
 
             # L1 Mel-Spectrogram Loss
             loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
-
-            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
-            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
-            loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
+            
+            if h.use_mpd:
+                y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
+                loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
+            
+            
+            y_ds_hat_r, fmap_s_r = mstftd(y)
+            y_ds_hat_g, fmap_s_g = mstftd(y_g_hat)
+            
+            
+            
             loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
-            loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
+            if h.use_mpd:
+                loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
+            
             loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
+            if h.use_mpd:
+                loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
+            else:
+                loss_gen_all = loss_gen_s + loss_fm_s + loss_mel
 
             loss_gen_all.backward()
             optim_g.step()
@@ -191,13 +218,22 @@ def train(rank, a, h):
                     save_checkpoint(checkpoint_path,
                                     {'generator': (generator.module if h.num_gpus > 1 else generator).state_dict()})
                     checkpoint_path = "{}/do_{:08d}".format(a.checkpoint_path, steps)
-                    save_checkpoint(checkpoint_path, 
+                    if h.use_mpd:
+                        save_checkpoint(checkpoint_path, 
                                     {'mpd': (mpd.module if h.num_gpus > 1
                                                          else mpd).state_dict(),
-                                     'msd': (msd.module if h.num_gpus > 1
-                                                         else msd).state_dict(),
+                                     'mstftd': (mstftd.module if h.num_gpus > 1
+                                                         else mstftd).state_dict(),
                                      'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
                                      'epoch': epoch})
+                    else:
+                        save_checkpoint(checkpoint_path, 
+                                    {'mstftd': (mstftd.module if h.num_gpus > 1
+                                                         else mstftd).state_dict(),
+                                     'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
+                                     'epoch': epoch})
+                    
+                     
 
                 # Tensorboard summary logging
                 if steps % a.summary_interval == 0:
