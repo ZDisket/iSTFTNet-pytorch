@@ -11,6 +11,11 @@ from librosa.filters import mel as librosa_mel_fn
 MAX_WAV_VALUE = 32768.0
 
 
+def pad_to(in_tens,tgt_size):
+  pad_v = torch.zeros([tgt_size - in_tens.size(0)],dtype=in_tens.dtype)
+  return torch.cat((in_tens,pad_v))
+
+
 def load_wav(full_path):
     sampling_rate, data = read(full_path)
     return data, sampling_rate
@@ -62,7 +67,7 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
     y = y.squeeze(1)
 
     spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[str(y.device)],
-                      center=center, pad_mode='reflect', normalized=False, onesided=True)
+                      center=center, pad_mode='reflect', return_complex=False, normalized=False, onesided=True)
 
     spec = torch.sqrt(spec.pow(2).sum(-1)+(1e-9))
 
@@ -73,13 +78,16 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
 
 
 def get_dataset_filelist(a):
+
+        
     with open(a.input_training_file, 'r', encoding='utf-8') as fi:
-        training_files = [os.path.join(a.input_wavs_dir, x.split('|')[0] + '.wav')
-                          for x in fi.read().split('\n') if len(x) > 0]
+        training_files = [os.path.join(a.input_wavs_dir, x.split('|')[0])
+                          for x in fi.read().split('\n') if len(x) > 0 and not "IPA" in x]
 
     with open(a.input_validation_file, 'r', encoding='utf-8') as fi:
-        validation_files = [os.path.join(a.input_wavs_dir, x.split('|')[0] + '.wav')
-                            for x in fi.read().split('\n') if len(x) > 0]
+        validation_files = [os.path.join(a.input_wavs_dir, x.split('|')[0])
+                            for x in fi.read().split('\n') if len(x) > 0 and not "IPA" in x]
+    
     return training_files, validation_files
 
 
@@ -142,6 +150,7 @@ class MelDataset(torch.utils.data.Dataset):
         else:
             mel = np.load(
                 os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
+            
             mel = torch.from_numpy(mel)
 
             if len(mel.shape) < 3:
@@ -158,11 +167,25 @@ class MelDataset(torch.utils.data.Dataset):
                     mel = torch.nn.functional.pad(mel, (0, frames_per_seg - mel.size(2)), 'constant')
                     audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
 
+        
+        audio_sq = audio.squeeze(0)
+        
+        if len(audio_sq) != self.segment_size and self.split:
+            if len(audio_sq) < self.segment_size:
+                audio_sq = pad_to(audio_sq,self.segment_size)
+            else:
+                audio_sq = audio_sq[:self.segment_size]
+            
+            
+            audio = audio_sq.unsqueeze(0)
+        
         mel_loss = mel_spectrogram(audio, self.n_fft, self.num_mels,
                                    self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax_loss,
                                    center=False)
 
-        return (mel.squeeze(), audio.squeeze(0), filename, mel_loss.squeeze())
+        mel_ret, audio_ret, ml_ret = mel.squeeze(), audio.squeeze(0), mel_loss.squeeze()
+
+        return (mel_ret, audio_ret, filename, ml_ret)
 
     def __len__(self):
         return len(self.audio_files)

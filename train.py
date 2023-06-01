@@ -19,7 +19,7 @@ from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator,
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
 from stft import TorchSTFT
 
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = False
 
 
 def train(rank, a, h):
@@ -43,6 +43,14 @@ def train(rank, a, h):
     if os.path.isdir(a.checkpoint_path):
         cp_g = scan_checkpoint(a.checkpoint_path, 'g_')
         cp_do = scan_checkpoint(a.checkpoint_path, 'do_')
+    
+    # prevent loading pretrained if we find a checkpoint
+    if cp_g is None ir cp_do is None:
+        a.pretrained = ""
+    
+    if len(a.pretrained):
+        cp_g = scan_checkpoint(a.pretrained, 'g_')
+        cp_do = scan_checkpoint(a.pretrained, 'do_')
 
     steps = 0
     if cp_g is None or cp_do is None:
@@ -54,8 +62,13 @@ def train(rank, a, h):
         generator.load_state_dict(state_dict_g['generator'])
         mpd.load_state_dict(state_dict_do['mpd'])
         msd.load_state_dict(state_dict_do['msd'])
+        
         steps = state_dict_do['steps'] + 1
         last_epoch = state_dict_do['epoch']
+        if len(a.pretrained):
+            print("WARM START mode. Resetting scheduler.")
+            steps = 1
+            last_epoch = 0
 
     if h.num_gpus > 1:
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)

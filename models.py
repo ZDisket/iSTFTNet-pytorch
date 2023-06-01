@@ -78,7 +78,7 @@ class Generator(torch.nn.Module):
         self.h = h
         self.num_kernels = len(h.resblock_kernel_sizes)
         self.num_upsamples = len(h.upsample_rates)
-        self.conv_pre = weight_norm(Conv1d(80, h.upsample_initial_channel, 7, 1, padding=3))
+        self.conv_pre = weight_norm(Conv1d(h.num_mels, h.upsample_initial_channel, 7, 1, padding=3))
         resblock = ResBlock1 if h.resblock == '1' else ResBlock2
 
         self.ups = nn.ModuleList()
@@ -251,11 +251,19 @@ class MultiScaleDiscriminator(torch.nn.Module):
 
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
+def auto_slice_2nd_dim(tens1, tens2):
+    if tens1.size(2) > tens2.size(2):
+        tens1 = tens1[:,:,:tens2.size(2)]
+    if tens2.size(2) > tens1.size(2):
+        tens2 = tens2[:,:,:tens1.size(2)]
 
+    return tens1, tens2
+    
 def feature_loss(fmap_r, fmap_g):
     loss = 0
     for dr, dg in zip(fmap_r, fmap_g):
         for rl, gl in zip(dr, dg):
+            rl, gl = auto_slice_2nd_dim(rl, gl)
             loss += torch.mean(torch.abs(rl - gl))
 
     return loss*2
