@@ -34,6 +34,7 @@ def train(rank, a, h):
     mpd = MultiPeriodDiscriminator().to(device)
     msd = MultiScaleDiscriminator().to(device)
     stft = TorchSTFT(filter_length=h.gen_istft_n_fft, hop_length=h.gen_istft_hop_size, win_length=h.gen_istft_n_fft).to(device)
+    stft.window = stft.window.to(device) #fix window being on cpu somehow
 
     if rank == 0:
         print(generator)
@@ -45,7 +46,7 @@ def train(rank, a, h):
         cp_do = scan_checkpoint(a.checkpoint_path, 'do_')
     
     # prevent loading pretrained if we find a checkpoint
-    if cp_g is None ir cp_do is None:
+    if cp_g is not None:
         a.pretrained = ""
     
     if len(a.pretrained):
@@ -135,6 +136,8 @@ def train(rank, a, h):
             y = y.unsqueeze(1)
             # y_g_hat = generator(x)
             spec, phase = generator(x)
+
+            spec, phase = spec.to(device), phase.to(device)
 
             y_g_hat = stft.inverse(spec, phase)
 
@@ -257,12 +260,13 @@ def main():
     parser.add_argument('--input_training_file', default='LJSpeech-1.1/training.txt')
     parser.add_argument('--input_validation_file', default='LJSpeech-1.1/validation.txt')
     parser.add_argument('--checkpoint_path', default='cp_hifigan')
+    parser.add_argument('--pretrained', default='')
     parser.add_argument('--config', default='')
     parser.add_argument('--training_epochs', default=3100, type=int)
     parser.add_argument('--stdout_interval', default=5, type=int)
     parser.add_argument('--checkpoint_interval', default=5000, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
-    parser.add_argument('--validation_interval', default=1000, type=int)
+    parser.add_argument('--validation_interval', default=2500, type=int)
     parser.add_argument('--fine_tuning', default=False, type=bool)
 
     a = parser.parse_args()
