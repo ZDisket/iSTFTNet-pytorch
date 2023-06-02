@@ -15,7 +15,7 @@ from torch.nn.parallel import DistributedDataParallel
 from env import AttrDict, build_env
 from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
 from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
-    discriminator_loss
+    discriminator_loss, edisc_loss, etotal_loss
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
 from stft import TorchSTFT
 from msstftd import MultiScaleSTFTDiscriminator
@@ -161,9 +161,11 @@ def train(rank, a, h):
                 loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
 
             # MSTFTD
-            y_ds_hat_r, _ = mstftd(y)
-            y_ds_hat_g, _ = mstftd(y_g_hat.detach())
-            loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
+            lgs_real, _ = mstftd(y)
+            lgs_fake, _ =  mstftd(y_g_hat.detach())
+
+            loss_disc_s = edisc_loss(lgs_real, lgs_fake)
+            
 
            
             
@@ -185,20 +187,21 @@ def train(rank, a, h):
                 loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
             
             
-            y_ds_hat_r, fmap_s_r = mstftd(y)
-            y_ds_hat_g, fmap_s_g = mstftd(y_g_hat)
+            lgs_real, fmap_s_r = mstftd(y)
+            lgs_fake, fmap_s_g = mstftd(y_g_hat)
             
             
             
-            loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
+            loss_s_total = etotal_loss(fmap_s_r, lgs_fake,
+                                   fmap_s_g, y, y_g_hat,
+                                   h.sampling_rate)
             if h.use_mpd:
                 loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
             
-            loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
             if h.use_mpd:
-                loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
+                loss_gen_all = loss_s_total + loss_gen_f + loss_fm_f + loss_mel
             else:
-                loss_gen_all = loss_gen_s + loss_fm_s + loss_mel
+                loss_gen_all = loss_s_total + loss_mel
 
             loss_gen_all.backward()
             optim_g.step()
@@ -210,7 +213,7 @@ def train(rank, a, h):
                         mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
 
                     print('Steps : {:d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, s/b : {:4.3f}'.
-                          format(steps, loss_gen_all, mel_error, time.time() - start_b))
+                          format(steps, loss_gen_all.item(), mel_error, time.time() - start_b))
 
                 # checkpointing
                 if steps % a.checkpoint_interval == 0 and steps != 0:
