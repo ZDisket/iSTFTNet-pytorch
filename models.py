@@ -7,6 +7,46 @@ from utils import init_weights, get_padding
 
 LRELU_SLOPE = 0.1
 
+from torch import nn, sin, pow
+from torch.nn import Parameter
+from torch.distributions.exponential import Exponential
+
+
+# Scripting this brings model speed up 1.4x
+@torch.jit.script
+def snake(x, alpha):
+    shape = x.shape
+    x = x.reshape(shape[0], shape[1], -1)
+    x = x + (alpha + 1e-9).reciprocal() * torch.sin(alpha * x).pow(2)
+    x = x.reshape(shape)
+    return x
+
+
+class Snake1d(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.ones(1, channels, 1))
+
+    def forward(self, x):
+        return snake(x, self.alpha)
+
+
+class USnake(nn.Module):
+    """
+    a-storage-only implementation of Snake function, for inputs whose shape is unknown or varying
+    Snake ∶= x + 1/a* sin^2 (xa)
+    
+    x: input
+    a: the a value. Higher values = higher-frequency, 
+        5-50 is a good starting point if you already think your data is periodic, 
+        consider using lower e.g. 0.5 if you think not.
+    """
+    def __init__(self, a):
+        super(USnake,self).__init__()
+        self.a = a
+    
+    def forward(self, x):
+        return  x + (1.0/self.a) * pow(sin(x * self.a), 2)
 
 class ResBlock1(torch.nn.Module):
     def __init__(self, h, channels, kernel_size=3, dilation=(1, 3, 5)):
@@ -82,10 +122,13 @@ class Generator(torch.nn.Module):
         resblock = ResBlock1 if h.resblock == '1' else ResBlock2
 
         self.ups = nn.ModuleList()
+        self.ups_snakes = nn.ModuleList()
         for i, (u, k) in enumerate(zip(h.upsample_rates, h.upsample_kernel_sizes)):
             self.ups.append(weight_norm(
                 ConvTranspose1d(h.upsample_initial_channel//(2**i), h.upsample_initial_channel//(2**(i+1)),
                                 k, u, padding=(k-u)//2)))
+            self.ups_snakes.append(Snake1d(h.upsample_initial_channel//(2**i)))
+            
 
         self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):
@@ -94,6 +137,7 @@ class Generator(torch.nn.Module):
                 self.resblocks.append(resblock(h, ch, k, d))
 
         self.post_n_fft = h.gen_istft_n_fft
+        self.snake_post = Snake1d(ch)
         self.conv_post = weight_norm(Conv1d(ch, self.post_n_fft + 2, 7, 1, padding=3))
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
@@ -102,7 +146,7 @@ class Generator(torch.nn.Module):
     def forward(self, x):
         x = self.conv_pre(x)
         for i in range(self.num_upsamples):
-            x = F.leaky_relu(x, LRELU_SLOPE)
+            x = self.ups_snakes[i](x)
             x = self.ups[i](x)
             xs = None
             for j in range(self.num_kernels):
@@ -111,7 +155,7 @@ class Generator(torch.nn.Module):
                 else:
                     xs += self.resblocks[i*self.num_kernels+j](x)
             x = xs / self.num_kernels
-        x = F.leaky_relu(x)
+        x = self.snake_post(x)
         x = self.reflection_pad(x)
         x = self.conv_post(x)
         spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])

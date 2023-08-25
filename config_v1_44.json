@@ -7,6 +7,7 @@
     "adam_b2": 0.99,
     "lr_decay": 0.999,
     "seed": 1234,
+    "fp16_run": true,
 
     "upsample_rates": [8,8],
     "upsample_kernel_sizes": [16,16],

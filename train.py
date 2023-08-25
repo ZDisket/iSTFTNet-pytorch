@@ -18,6 +18,7 @@ from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator,
     discriminator_loss
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
 from stft import TorchSTFT
+from torch.cuda.amp import autocast, GradScaler
 
 torch.backends.cudnn.benchmark = False
 
@@ -90,7 +91,7 @@ def train(rank, a, h):
     training_filelist, validation_filelist = get_dataset_filelist(a)
 
     trainset = MelDataset(training_filelist, h.segment_size, h.n_fft, h.num_mels,
-                          h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, n_cache_reuse=0,
+                          h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, n_cache_reuse=0,
                           shuffle=False if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device,
                           fine_tuning=a.fine_tuning, base_mels_path=a.input_mels_dir)
 
@@ -104,7 +105,7 @@ def train(rank, a, h):
 
     if rank == 0:
         validset = MelDataset(validation_filelist, h.segment_size, h.n_fft, h.num_mels,
-                              h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, False, n_cache_reuse=0,
+                              h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, False, False, n_cache_reuse=0,
                               fmax_loss=h.fmax_for_loss, device=device, fine_tuning=a.fine_tuning,
                               base_mels_path=a.input_mels_dir)
         validation_loader = DataLoader(validset, num_workers=1, shuffle=False,
@@ -115,6 +116,7 @@ def train(rank, a, h):
 
         sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
 
+    scaler = GradScaler(enabled=h.fp16_run)
     generator.train()
     mpd.train()
     msd.train()
@@ -135,29 +137,30 @@ def train(rank, a, h):
             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
             y = y.unsqueeze(1)
             # y_g_hat = generator(x)
-            spec, phase = generator(x)
+            with autocast(enabled=h.fp16_run):
+                spec, phase = generator(x)
+                spec, phase = spec.to(device), phase.to(device)
+                y_g_hat = stft.inverse(spec, phase)
+    
+                y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
+                                              h.fmin, h.fmax_for_loss)
+    
+                optim_d.zero_grad()
+    
+                # MPD
+                y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
+                loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
+    
+                # MSD
+                y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
+                loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
+    
+                loss_disc_all = loss_disc_s + loss_disc_f
 
-            spec, phase = spec.to(device), phase.to(device)
-
-            y_g_hat = stft.inverse(spec, phase)
-
-            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
-                                          h.fmin, h.fmax_for_loss)
-
-            optim_d.zero_grad()
-
-            # MPD
-            y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
-            loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
-
-            # MSD
-            y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
-            loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
-
-            loss_disc_all = loss_disc_s + loss_disc_f
-
-            loss_disc_all.backward()
-            optim_d.step()
+            
+            scaler.scale(loss_disc_all).backward()
+            scaler.unscale_(optim_d)
+            scaler.step(optim_d)
 
             # Generator
             optim_g.zero_grad()
@@ -165,16 +168,21 @@ def train(rank, a, h):
             # L1 Mel-Spectrogram Loss
             loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
 
-            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
-            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
+            with autocast(enabled=h.fp16_run):
+                y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
+                y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
+
             loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
             loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
             loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
             loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
             loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
 
-            loss_gen_all.backward()
-            optim_g.step()
+            scaler.scale(loss_gen_all).backward()
+            scaler.unscale_(optim_g)
+            scaler.step(optim_g)
+            
+            scaler.update()
 
             if rank == 0:
                 # STDOUT logging

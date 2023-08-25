@@ -7,17 +7,18 @@ import numpy as np
 from librosa.util import normalize
 from scipy.io.wavfile import read
 from librosa.filters import mel as librosa_mel_fn
-
+import soundfile as sf
 MAX_WAV_VALUE = 32768.0
-
-
+import skimage
+import skimage.filters
+import librosa
 def pad_to(in_tens,tgt_size):
   pad_v = torch.zeros([tgt_size - in_tens.size(0)],dtype=in_tens.dtype)
   return torch.cat((in_tens,pad_v))
 
 
 def load_wav(full_path):
-    sampling_rate, data = read(full_path)
+    data, sampling_rate = sf.read(full_path)
     return data, sampling_rate
 
 
@@ -93,7 +94,7 @@ def get_dataset_filelist(a):
 
 class MelDataset(torch.utils.data.Dataset):
     def __init__(self, training_files, segment_size, n_fft, num_mels,
-                 hop_size, win_size, sampling_rate,  fmin, fmax, split=True, shuffle=True, n_cache_reuse=1,
+                 hop_size, win_size, sampling_rate,  fmin, fmax, pre_blur, blur_sigma=1.0729, split=True, shuffle=True, n_cache_reuse=1,
                  device=None, fmax_loss=None, fine_tuning=False, base_mels_path=None):
         self.audio_files = training_files
         random.seed(1234)
@@ -115,11 +116,44 @@ class MelDataset(torch.utils.data.Dataset):
         self.device = device
         self.fine_tuning = fine_tuning
         self.base_mels_path = base_mels_path
+        self.pre_blur = pre_blur
+        self.blur_sigma = blur_sigma
+        self.bad_indexes = []
+        self.num_resample_warns = 0
+        self.num_resample_warns_max = 10
+        if fine_tuning:
+            print(f"Load mels from {base_mels_path}")
 
     def __getitem__(self, index):
+        if index in self.bad_indexes:
+            return self.__getitem__(index + 1)
+            
         filename = self.audio_files[index]
         if self._cache_ref_count == 0:
-            audio, sampling_rate = load_wav(filename)
+            try:
+                filen, ext = os.path.splitext(filename)
+                file_p_path = filename.replace(ext, "_p.ogg")
+                if os.path.isfile(file_p_path):
+                    filename = file_p_path
+                    
+                audio, sampling_rate = load_wav(filename)
+                if sampling_rate != self.sampling_rate:
+                    if self.num_resample_warns < self.num_resample_warns_max:
+                        print(f"File SR {sampling_rate} != {self.sampling_rate}.. resampling and re-saving to {file_p_path}\nthis will only print {self.num_resample_warns_max} times")
+                        self.num_resample_warns += 1
+                    
+                    audio = librosa.resample(audio, sampling_rate, self.sampling_rate, res_type="kaiser_fast")
+                    sampling_rate = self.sampling_rate
+                    sf.write(file_p_path, audio, sampling_rate)
+                    
+            except KeyboardInterrupt:
+                return None
+            except:
+                print(f"Could not open file {filename}")
+                self.bad_indexes.append(index)
+                return self.__getitem__(index + 1)
+                
+            
             audio = audio / MAX_WAV_VALUE
             if not self.fine_tuning:
                 audio = normalize(audio) * 0.95
@@ -147,14 +181,22 @@ class MelDataset(torch.utils.data.Dataset):
             mel = mel_spectrogram(audio, self.n_fft, self.num_mels,
                                   self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax,
                                   center=False)
+            if self.pre_blur:
+                mel = torch.from_numpy(
+                    skimage.filters.gaussian(mel.squeeze().cpu().numpy(), 
+                                             sigma=self.blur_sigma, channel_axis=0)).unsqueeze(0)
         else:
             mel = np.load(
                 os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
             
             mel = torch.from_numpy(mel)
+            if torch.isnan(mel).any():
+                raise ValueError(f"NaN in mel {filename}")
 
             if len(mel.shape) < 3:
                 mel = mel.unsqueeze(0)
+
+            print(mel.size())
 
             if self.split:
                 frames_per_seg = math.ceil(self.segment_size / self.hop_size)
