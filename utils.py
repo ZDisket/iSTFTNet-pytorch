@@ -5,7 +5,7 @@ import torch
 from torch.nn.utils import weight_norm
 matplotlib.use("Agg")
 import matplotlib.pylab as plt
-
+from istftnetfe import ISTFTNetFE
 
 def plot_spectrogram(spectrogram):
     fig, ax = plt.subplots(figsize=(10, 2))
@@ -55,4 +55,22 @@ def scan_checkpoint(cp_dir, prefix):
     if len(cp_list) == 0:
         return None
     return sorted(cp_list)[-1]
+
+def save_ts_gen(folpath, gen, g_stft, sr):
+  device_before = next(gen.parameters()).device
+  print(f"Exporting TorchScript generator to {folpath}")
+  with torch.no_grad():
+    g_fe = ISTFTNetFE(gen, g_stft)
+    g_fe.export_ts(folpath, sr)
+  
+  # return the gen and stft to their devices to avoid errors at next iter
+  gen = gen.to(device_before)
+  g_stft = g_stft.to(device_before)
+  g_stft.window = g_stft.window.to(device_before)
+  print("Done.")
+  return folpath
+
+  
+  
+
 

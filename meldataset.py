@@ -9,6 +9,7 @@ from scipy.io.wavfile import read
 from librosa.filters import mel as librosa_mel_fn
 import soundfile as sf
 MAX_WAV_VALUE = 32768.0
+import sklearn
 import skimage
 import skimage.filters
 import librosa
@@ -155,8 +156,8 @@ class MelDataset(torch.utils.data.Dataset):
                 
             
             audio = audio / MAX_WAV_VALUE
-            if not self.fine_tuning:
-                audio = normalize(audio) * 0.95
+            
+            audio = normalize(audio) * 0.95
             self.cached_wav = audio
             if sampling_rate != self.sampling_rate:
                 raise ValueError("{} SR doesn't match target {} SR".format(
@@ -188,8 +189,9 @@ class MelDataset(torch.utils.data.Dataset):
         else:
             mel = np.load(
                 os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
-            
+
             mel = torch.from_numpy(mel)
+            
             if torch.isnan(mel).any():
                 raise ValueError(f"NaN in mel {filename}")
 
@@ -218,6 +220,7 @@ class MelDataset(torch.utils.data.Dataset):
             
             
             audio = audio_sq.unsqueeze(0)
+        
         
         mel_loss = mel_spectrogram(audio, self.n_fft, self.num_mels,
                                    self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax_loss,

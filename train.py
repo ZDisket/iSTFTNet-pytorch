@@ -16,7 +16,7 @@ from env import AttrDict, build_env
 from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
 from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
     discriminator_loss
-from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
+from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint, save_ts_gen
 from stft import TorchSTFT
 from torch.cuda.amp import autocast, GradScaler
 
@@ -206,6 +206,11 @@ def train(rank, a, h):
                                                          else msd).state_dict(),
                                      'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
                                      'epoch': epoch})
+                    ts_checkpoint_path = "{}/EXPORT_{:08d}".format(a.checkpoint_path, steps)
+                    save_ts_gen(ts_checkpoint_path,
+                                generator.module if h.num_gpus > 1 else generator,
+                                stft,
+                                h.sampling_rate)
 
                 # Tensorboard summary logging
                 if steps % a.summary_interval == 0:
