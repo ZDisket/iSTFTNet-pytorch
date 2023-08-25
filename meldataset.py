@@ -196,8 +196,6 @@ class MelDataset(torch.utils.data.Dataset):
             if len(mel.shape) < 3:
                 mel = mel.unsqueeze(0)
 
-            print(mel.size())
-
             if self.split:
                 frames_per_seg = math.ceil(self.segment_size / self.hop_size)
 
