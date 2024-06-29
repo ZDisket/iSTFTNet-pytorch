@@ -22,6 +22,27 @@ def snake(x, alpha):
     return x
 
 
+class SEBlock1D(nn.Module):
+    """
+    Lightweight Squeeze-Excite attention.
+    """
+
+    def __init__(self, in_channels, reduction=16):
+        super(SEBlock1D, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y.expand_as(x)
+
 class Snake1d(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -62,6 +83,7 @@ class ResBlock1(torch.nn.Module):
         ])
         self.convs1.apply(init_weights)
 
+
         self.convs2 = nn.ModuleList([
             weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=1,
                                padding=get_padding(kernel_size, 1))),
@@ -72,13 +94,20 @@ class ResBlock1(torch.nn.Module):
         ])
         self.convs2.apply(init_weights)
 
+        self.snakes1 = nn.ModuleList([Snake1d(channels) for _ in range(len(self.convs1))])
+        self.snakes2 = nn.ModuleList([Snake1d(channels) for _ in range(len(self.convs2))])
+
+        self.se_block = SEBlock1D(channels)
+
     def forward(self, x):
-        for c1, c2 in zip(self.convs1, self.convs2):
-            xt = F.leaky_relu(x, LRELU_SLOPE)
+        for c1, c2, s1, s2 in zip(self.convs1, self.convs2, self.snakes1, self.snakes2):
+            xt = s1(x)
             xt = c1(xt)
-            xt = F.leaky_relu(xt, LRELU_SLOPE)
+            xt = s2(xt)
             xt = c2(xt)
             x = xt + x
+
+        x = self.se_block(x)
         return x
 
     def remove_weight_norm(self):
