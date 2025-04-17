@@ -3,6 +3,8 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
+from finite_scalar_quantization import FSQ
+from convs import ResidualBlock1D
 from utils import init_weights, get_padding
 
 LRELU_SLOPE = 0.1
@@ -20,6 +22,10 @@ def snake(x, alpha):
     x = x + (alpha + 1e-9).reciprocal() * torch.sin(alpha * x).pow(2)
     x = x.reshape(shape)
     return x
+
+
+
+
 
 
 class SEBlock1D(nn.Module):
@@ -141,6 +147,100 @@ class ResBlock2(torch.nn.Module):
             remove_weight_norm(l)
 
 
+class AudioEncoder(nn.Module):
+    def __init__(self, in_channels, channels, kernel_sizes, strides, gen_istft_n_fft, fsq_levels=[8, 5, 5, 5], dropout=0.1):
+        """
+        Audio Kompressor
+        ResNet-based autoencoder with configurable encoder and decoder blocks.
+
+        Parameters:
+          - mel_channels (int): number of channels in the input spectrogram.
+          - channels (list of ints): list of channel dimensions for encoder blocks.
+            * The first element is the projected input dimension.
+            * The last element is the latent dimension.
+          - kernel_sizes (list of ints): list of kernel sizes for each ResidualBlock1D.
+            Length should be len(channels) - 1. The decoder will use these lists in reverse.
+        """
+        super(AudioEncoder, self).__init__()
+        # Project input from mel_channels to channels[0]
+        self.proj = nn.Linear(in_channels, channels[0])
+        self.quantizer_dim = len(fsq_levels)
+        self.post_n_fft = gen_istft_n_fft
+
+        # Encoder: build a sequence of ResidualBlock1D modules
+        self.encoder_blocks = nn.ModuleList([
+            ResidualBlock1D(channels[i], channels[i + 1], kernel_size=kernel_sizes[i], stride=strides[i], dropout=dropout, act="aptx")
+            for i in range(len(channels) - 1)
+        ])
+
+        # Quantization stage: here we use the latent dimension as the last element of channels.
+        latent_dim = channels[-1]
+
+        self.q_in_proj = nn.Linear(latent_dim, self.quantizer_dim)
+        self.quantizer = FSQ(levels=fsq_levels)
+        self.q_out_proj = nn.Linear(self.quantizer_dim, latent_dim)
+        self.codebook_size = 1024 # TODO: dyn calculate this
+
+        # Decoder: use the reversed lists so that the decoder mirrors the encoder.
+        rev_channels = list(reversed(channels))
+        rev_kernel_sizes = list(reversed(kernel_sizes))
+        rev_strides = list(reversed(strides))
+
+        self.decoder_blocks = nn.ModuleList([
+            ResidualBlock1D(rev_channels[i], rev_channels[i + 1], kernel_size=rev_kernel_sizes[i], stride=rev_strides[i] * -1, dropout=dropout, act="aptx", causal=False)
+            for i in range(len(rev_channels) - 1)
+        ])
+
+        self.conv_post = weight_norm(Conv1d(channels[0], self.post_n_fft + 2, 7, 1, padding=3))
+
+    def forward(self, x):
+        """
+        Forward pass.
+
+        Parameters:
+          - x: Tensor of shape (batch, audio_len, 1)
+          - x_lengths: (batch,), int lengths of each thing
+        Returns:
+          - Spec, phase (iSTFT)
+        """
+        # Project input to channel dimension channels[0]
+        x = self.proj(x)  # (batch, audio_len, channels[0])
+        # Permute to (batch, channels[0], mel_len) for 1D convolutions.
+        x = x.permute(0, 2, 1)
+
+        x_mask = None
+
+        # Pass through the encoder blocks
+        for block in self.encoder_blocks:
+            x = block(x, x_mask=x_mask)
+
+        # Permute back to (batch, mel_len, latent_dim)
+        x = x.permute(0, 2, 1)
+        x = self.q_in_proj(x)
+        xhat, indices = self.quantizer(x)
+        x = self.q_out_proj(xhat)
+        # Permute for the decoder
+        x = x.permute(0, 2, 1)
+
+        # Pass through the decoder blocks
+        for block in self.decoder_blocks:
+            x = block(x, x_mask=x_mask)
+
+
+        return self.to_audio(x)
+
+    def to_audio(self, x):
+        x = self.conv_post(x)
+
+        spec = torch.exp(x[:, :self.post_n_fft // 2 + 1, :])
+        phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
+
+        return spec, phase
+
+
+
+
+
 class Generator(torch.nn.Module):
     def __init__(self, h):
         super(Generator, self).__init__()
@@ -254,6 +354,7 @@ class MultiPeriodDiscriminator(torch.nn.Module):
         y_d_gs = []
         fmap_rs = []
         fmap_gs = []
+
         for i, d in enumerate(self.discriminators):
             y_d_r, fmap_r = d(y)
             y_d_g, fmap_g = d(y_hat)

@@ -148,6 +148,7 @@ class MelDataset(torch.utils.data.Dataset):
                     sf.write(file_p_path, audio, sampling_rate)
                     
             except KeyboardInterrupt:
+                raise ValueError("Keyboard interrupt...")
                 return None
             except:
                 print(f"Could not open file {filename}")
@@ -229,6 +230,167 @@ class MelDataset(torch.utils.data.Dataset):
         mel_ret, audio_ret, ml_ret = mel.squeeze(), audio.squeeze(0), mel_loss.squeeze()
 
         return (mel_ret, audio_ret, filename, ml_ret)
+
+    def __len__(self):
+        return len(self.audio_files)
+
+
+
+class AudioDataset(torch.utils.data.Dataset):
+    """
+    Dataset for an audio autoencoder.
+    Loads and serves audio segments as input.
+    Computes and serves the corresponding mel spectrogram for loss calculation.
+    """
+    def __init__(self, training_files, segment_size, sampling_rate,
+                 n_fft, num_mels, hop_size, win_size, fmin, fmax,
+                 split=True, shuffle=True, n_cache_reuse=1, device=None, fmax_loss=None):
+        """
+        Initializes the AudioDataset.
+
+        Args:
+            training_files (list): List of paths to audio files.
+            segment_size (int): The desired length of audio segments in samples.
+            sampling_rate (int): The target sampling rate for the audio.
+            n_fft (int): FFT window size for mel spectrogram calculation.
+            num_mels (int): Number of mel bins.
+            hop_size (int): Hop length for mel spectrogram calculation.
+            win_size (int): Window size for mel spectrogram calculation.
+            fmin (int): Minimum frequency for mel spectrogram.
+            fmax (int): Maximum frequency for mel spectrogram.
+            split (bool, optional): Whether to split audio into segments. Defaults to True.
+            shuffle (bool, optional): Whether to shuffle the training files. Defaults to True.
+            n_cache_reuse (int, optional): How many times to reuse a cached audio file. Defaults to 1.
+            device (torch.device or str, optional): Device for tensor operations. Defaults to None.
+            fmax_loss (int, optional): Separate max frequency for the loss mel spectrogram.
+                                       If None, uses fmax. Defaults to None.
+        """
+        super().__init__()
+        self.audio_files = training_files
+        random.seed(1234)
+        if shuffle:
+            random.shuffle(self.audio_files)
+
+        # Audio parameters
+        self.segment_size = segment_size
+        self.sampling_rate = sampling_rate
+        self.split = split
+        self.n_cache_reuse = n_cache_reuse
+        self.device = device
+
+        # Mel spectrogram parameters (re-introduced for loss calculation)
+        self.n_fft = n_fft
+        self.num_mels = num_mels
+        self.hop_size = hop_size
+        self.win_size = win_size
+        self.fmin = fmin
+        self.fmax = fmax
+        # Use fmax_loss if provided for the mel calculation, otherwise use fmax
+        self.fmax_loss = fmax_loss if fmax_loss is not None else fmax
+
+        # Caching and state
+        self.cached_wav = None
+        self._cache_ref_count = 0
+        self.bad_indexes = []
+        self.num_resample_warns = 0
+        self.num_resample_warns_max = 10
+
+        print(f"Initialized AudioDataset with {len(self.audio_files)} files.")
+        if not self.split:
+             print("Warning: split=False. Dataset will return variable length audio and mels.")
+        elif self.segment_size <= 0:
+             raise ValueError("segment_size must be positive when split=True")
+
+    def __getitem__(self, index):
+        # Skip known bad files
+        if index in self.bad_indexes:
+            next_index = (index + 1) % len(self.audio_files)
+            return self.__getitem__(next_index)
+
+        filename = self.audio_files[index]
+
+        # Load audio file or use cache
+        if self._cache_ref_count == 0:
+            try:
+                filen, ext = os.path.splitext(filename)
+                file_p_path = filename.replace(ext, "_p.ogg")
+                load_path = file_p_path if os.path.isfile(file_p_path) else filename
+                audio, sampling_rate = load_wav(load_path)
+
+                if sampling_rate != self.sampling_rate:
+                    # Handle resampling (same as before)
+                    if self.num_resample_warns < self.num_resample_warns_max:
+                        print(f"Warning: Resampling '{filename}' from {sampling_rate}Hz to {self.sampling_rate}Hz...")
+                        self.num_resample_warns += 1
+                        if self.num_resample_warns == self.num_resample_warns_max:
+                            print("(...suppressing further resampling warnings)")
+                    audio = librosa.resample(y=audio, orig_sr=sampling_rate, target_sr=self.sampling_rate, res_type="kaiser_fast")
+                    sampling_rate = self.sampling_rate
+                    try:
+                        sf.write(file_p_path, audio, sampling_rate)
+                    except Exception as e:
+                        print(f"Warning: Could not save resampled file {file_p_path}: {e}")
+
+                # --- Audio Preprocessing ---
+                # Normalize amplitude (using placeholder function)
+                audio = audio / MAX_WAV_VALUE
+                audio = normalize(audio) # Assuming normalize returns numpy array
+
+                # --- Caching ---
+                self.cached_wav = audio
+                self._cache_ref_count = self.n_cache_reuse
+
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(f"Error loading or processing file {filename}: {e}")
+                self.bad_indexes.append(index)
+                next_index = (index + 1) % len(self.audio_files)
+                return self.__getitem__(next_index)
+        else:
+            audio = self.cached_wav
+            self._cache_ref_count -= 1
+
+        # Convert to PyTorch tensor and add channel dimension
+        audio_tensor = torch.FloatTensor(audio)
+        audio_tensor = audio_tensor.unsqueeze(0) # Shape: [1, num_samples]
+
+        # --- Segmentation (if split=True) ---
+        if self.split:
+            if audio_tensor.size(1) >= self.segment_size:
+                max_audio_start = audio_tensor.size(1) - self.segment_size
+                audio_start = random.randint(0, max_audio_start)
+                segment = audio_tensor[:, audio_start:audio_start+self.segment_size]
+            else:
+                segment = torch.nn.functional.pad(audio_tensor, (0, self.segment_size - audio_tensor.size(1)), 'constant')
+        else:
+            segment = audio_tensor # Use the whole audio if not splitting
+
+        # --- Final Audio Segment Preparation ---
+        # Ensure correct length if splitting (safeguard)
+        if self.split and segment.size(1) != self.segment_size:
+             print(f"Warning: Segment length mismatch for {filename}. Padding again.")
+             segment = pad_to(segment, self.segment_size) # Shape: [1, segment_size]
+
+        # --- Calculate Mel Spectrogram for Loss ---
+        # Use the final audio segment 'segment' as input
+        # The mel_spectrogram function expects shape [..., time] -> [1, segment_size] is correct
+        mel_loss = mel_spectrogram(segment, self.n_fft, self.num_mels,
+                                   self.sampling_rate, self.hop_size, self.win_size,
+                                   self.fmin, self.fmax_loss, # Use fmax_loss here
+                                   center=False)
+        # mel_loss shape: [1, num_mels, time_frames]
+
+        # --- Prepare Return Values ---
+        # Audio segment (input for autoencoder), remove channel dim -> [segment_size]
+        audio_ret = segment.squeeze(0)
+        # Mel spectrogram (target for loss), remove batch dim -> [num_mels, time_frames]
+        mel_ret = mel_loss.squeeze(0)
+
+        # Return (audio_input, mel_target)
+        return (audio_ret, mel_ret)
+        # Optionally return filename:
+        # return (audio_ret, mel_ret, filename)
 
     def __len__(self):
         return len(self.audio_files)
