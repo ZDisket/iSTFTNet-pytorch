@@ -277,9 +277,11 @@ class ResidualBlock1D(nn.Module):
         dropout: float = 0.3,
         act: str = "relu",
         causal: bool = False,
+        output_pad = None
     ):
         super().__init__()
         self.stride = stride
+        op = 0 if output_pad is None else out_pad
 
         # --- conv1: may be downsample, upsample, or normal ---
         if causal:
@@ -298,7 +300,7 @@ class ResidualBlock1D(nn.Module):
                     kernel_size=kernel_size,
                     dilation=dilation,
                     stride=stride,
-                    padding="same"
+                    padding=0,
                 )
             elif stride < 0:
                 # transposed conv for up‐sampling
@@ -308,8 +310,8 @@ class ResidualBlock1D(nn.Module):
                     kernel_size=kernel_size,
                     dilation=dilation,
                     stride=abs(stride),
-                    padding=pad,
-                    output_padding=abs(stride) - 1
+                    padding = 0,
+                    output_padding=op,
                 )
             else:
                 # no length change
@@ -348,14 +350,15 @@ class ResidualBlock1D(nn.Module):
                 self.residual = nn.Conv1d(
                     in_channels, out_channels,
                     kernel_size=1,
-                    stride=stride
+                    stride=stride,
+                    padding=1
                 )
             elif stride < 0:
                 self.residual = nn.ConvTranspose1d(
                     in_channels, out_channels,
                     kernel_size=1,
                     stride=abs(stride),
-                    output_padding=abs(stride) - 1
+                    output_padding=op,
                 )
             else:
                 self.residual = nn.Conv1d(
@@ -365,6 +368,16 @@ class ResidualBlock1D(nn.Module):
         else:
             self.residual = nn.Identity()
 
+    @staticmethod
+    def _match_length(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        Lx, Lref = x.size(-1), ref.size(-1)
+        if Lx == Lref:
+            return x
+        if Lx < Lref:                                # pad on the right
+            return F.pad(x, (0, Lref - Lx))
+        # else: crop extra positions on the right
+        return x[..., :Lref]
+    
     def forward(self, x, x_mask: Optional[torch.Tensor] = None):
         # residual connection
         res = self.residual(x)
@@ -382,6 +395,8 @@ class ResidualBlock1D(nn.Module):
         out = self.norm2(out)
         if self.cbam is not None:
             out = self.cbam(out, x_mask)
+
+        res = self._match_length(res, out) 
         out = out + res
 
         # final activation + dropout (apply mask again if provided)

@@ -22,6 +22,9 @@ from torch.cuda.amp import autocast, GradScaler
 
 torch.backends.cudnn.benchmark = False
 
+def get_param_num(model):
+    num_param = sum(param.numel() for param in model.parameters())
+    return num_param
 
 def train(rank, a, h):
     if h.num_gpus > 1:
@@ -31,7 +34,12 @@ def train(rank, a, h):
     torch.cuda.manual_seed(h.seed)
     device = torch.device('cuda:{:d}'.format(rank))
 
-    generator = AudioEncoder(1, h.channels, h.kernel_sizes, h.strides, h.gen_istft_n_fft, h.fsq_levels, h.dropout).to(device)
+    generator = AudioEncoder(1, h.channels, h.kernel_sizes, h.strides, h.gen_istft_n_fft, h.fsq_levels, 0.1).to(device)
+
+    ae_params = get_param_num(generator)
+
+    print("Number of Autoencoder Parameters: {:.2f}M".format(ae_params / 1e6))
+
     mpd = MultiPeriodDiscriminator().to(device)
     msd = MultiScaleDiscriminator().to(device)
     stft = TorchSTFT(filter_length=h.gen_istft_n_fft, hop_length=h.gen_istft_hop_size, win_length=h.gen_istft_n_fft).to(device)
@@ -90,7 +98,7 @@ def train(rank, a, h):
 
     training_filelist, validation_filelist = get_dataset_filelist(a)
     trainset = AudioDataset(training_filelist, h.segment_size, h.sampling_rate, h.n_fft, h.num_mels,
-                            h.hop_size, h.win_size, h.fmin, h.fmax, False, n_cache_reuse=0,
+                            h.hop_size, h.win_size, h.fmin, h.fmax, True, n_cache_reuse=0,
                           shuffle=False if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device)
 
 
@@ -133,15 +141,17 @@ def train(rank, a, h):
                 start_b = time.time()
 
             y, y_mel = batch
-            x = y.unsqueeze(1)
+            y = y.unsqueeze(1)
+            x = y
             x = torch.autograd.Variable(x.to(device, non_blocking=True))
             y = torch.autograd.Variable(y.to(device, non_blocking=True))
             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
             # y_g_hat = generator(x)
-            with autocast(enabled=h.fp16_run):
+            with autocast(enabled=h.fp16_run, dtype=torch.bfloat16):
                 spec, phase = generator(x)
                 spec, phase = spec.to(device), phase.to(device)
                 y_g_hat = stft.inverse(spec, phase)
+                #print("mel yhgh ",y_g_hat.squeeze(1).size())
     
                 y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
                                               h.fmin, h.fmax_for_loss)
@@ -166,7 +176,13 @@ def train(rank, a, h):
             # Generator
             optim_g.zero_grad()
 
-            # L1 Mel-Spectrogram Loss
+            # L1 Mel-Spectrogram Los
+            # correct micro-differences (like 189 vs 192), we don't have time for tha
+            if y_mel.size(2) > y_g_hat_mel.size(2):
+                y_mel = y_mel[:,:,:y_g_hat_mel.size(2)]
+            elif y_mel.size(2) < y_g_hat_mel.size(2):
+                y_g_hat_mel = y_g_hat_mel[:,:,:y_mel.size(2)]
+           # print(y_mel.size(), y_g_hat_mel.size())
             loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
 
             with autocast(enabled=h.fp16_run):
@@ -208,10 +224,10 @@ def train(rank, a, h):
                                      'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
                                      'epoch': epoch})
                     ts_checkpoint_path = "{}/EXPORT_{:08d}".format(a.checkpoint_path, steps)
-                    save_ts_gen(ts_checkpoint_path,
-                                generator.module if h.num_gpus > 1 else generator,
-                                stft,
-                                h.sampling_rate)
+                  #  save_ts_gen(ts_checkpoint_path,
+                   #             generator.module if h.num_gpus > 1 else generator,
+                    #            stft,
+                     #           h.sampling_rate)
 
                 # Tensorboard summary logging
                 if steps % a.summary_interval == 0:
@@ -248,7 +264,7 @@ def train(rank, a, h):
                             if j <= 4:
                                 if steps == 0:
                                     sw.add_audio('gt/y_{}'.format(j), y[0], steps, h.sampling_rate)
-                                    sw.add_figure('gt/y_spec_{}'.format(j), plot_spectrogram(x[0]), steps)
+                                    sw.add_figure('gt/y_spec_{}'.format(j), plot_spectrogram(y_mel[0].detach().cpu()), steps)
 
                                 sw.add_audio('generated/y_hat_{}'.format(j), y_g_hat[0], steps, h.sampling_rate)
                                 y_hat_spec = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels,

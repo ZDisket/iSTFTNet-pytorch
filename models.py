@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
 from finite_scalar_quantization import FSQ
-from convs import ResidualBlock1D
+from convs import ResidualBlock1D, CBAM1D
 from utils import init_weights, get_padding
 
 LRELU_SLOPE = 0.1
@@ -103,7 +103,7 @@ class ResBlock1(torch.nn.Module):
         self.snakes1 = nn.ModuleList([Snake1d(channels) for _ in range(len(self.convs1))])
         self.snakes2 = nn.ModuleList([Snake1d(channels) for _ in range(len(self.convs2))])
 
-        self.se_block = SEBlock1D(channels)
+        self.cbam = CBAM1D(channels)
 
     def forward(self, x):
         for c1, c2, s1, s2 in zip(self.convs1, self.convs2, self.snakes1, self.snakes2):
@@ -112,8 +112,8 @@ class ResBlock1(torch.nn.Module):
             xt = s2(xt)
             xt = c2(xt)
             x = xt + x
-
-        x = self.se_block(x)
+        x_mask = torch.zeros((1, 1, 1), device=x.device).bool()
+        x = self.cbam(x, x_mask)
         return x
 
     def remove_weight_norm(self):
@@ -147,6 +147,18 @@ class ResBlock2(torch.nn.Module):
             remove_weight_norm(l)
 
 
+def downsample_layer(channels: int, stride: int) -> nn.Conv1d:
+    """3‑tap Conv1d that shrinks length by <stride>."""
+    return nn.Conv1d(channels, channels, kernel_size=3,
+                     stride=stride, padding=1)
+
+def upsample_layer(channels: int, stride: int) -> nn.ConvTranspose1d:
+    """3‑tap ConvTranspose1d that enlarges length by <stride>."""
+    return nn.ConvTranspose1d(channels, channels, kernel_size=3,
+                              stride=stride, padding=1,
+                              output_padding=stride - 1)
+
+
 class AudioEncoder(nn.Module):
     def __init__(self, in_channels, channels, kernel_sizes, strides, gen_istft_n_fft, fsq_levels=[8, 5, 5, 5], dropout=0.1):
         """
@@ -166,13 +178,18 @@ class AudioEncoder(nn.Module):
         self.proj = nn.Linear(in_channels, channels[0])
         self.quantizer_dim = len(fsq_levels)
         self.post_n_fft = gen_istft_n_fft
-
+        self.enc_down   = nn.ModuleList()
+        self.enc_blocks = nn.ModuleList()
         # Encoder: build a sequence of ResidualBlock1D modules
-        self.encoder_blocks = nn.ModuleList([
-            ResidualBlock1D(channels[i], channels[i + 1], kernel_size=kernel_sizes[i], stride=strides[i], dropout=dropout, act="aptx")
-            for i in range(len(channels) - 1)
-        ])
 
+        
+        for idx in range(len(strides) - 1):               # all but the last ResBlock
+            self.enc_blocks.append(ResidualBlock1D(
+                channels[idx], channels[idx+1],
+                kernel_size=kernel_sizes[idx],
+                dropout=dropout, act="aptx"))
+            self.enc_down.append(downsample_layer(channels[idx+1], strides[idx]))
+            
         # Quantization stage: here we use the latent dimension as the last element of channels.
         latent_dim = channels[-1]
 
@@ -185,13 +202,19 @@ class AudioEncoder(nn.Module):
         rev_channels = list(reversed(channels))
         rev_kernel_sizes = list(reversed(kernel_sizes))
         rev_strides = list(reversed(strides))
+        self.dec_up     = nn.ModuleList()
+        self.dec_blocks = nn.ModuleList()
 
-        self.decoder_blocks = nn.ModuleList([
-            ResidualBlock1D(rev_channels[i], rev_channels[i + 1], kernel_size=rev_kernel_sizes[i], stride=rev_strides[i] * -1, dropout=dropout, act="aptx", causal=False)
-            for i in range(len(rev_channels) - 1)
-        ])
-
-        self.conv_post = weight_norm(Conv1d(channels[0], self.post_n_fft + 2, 7, 1, padding=3))
+        
+        for idx in range(len(rev_strides) - 2):
+            self.dec_up.append(upsample_layer(rev_channels[idx], rev_strides[idx]))
+            self.dec_blocks.append(ResidualBlock1D(
+                rev_channels[idx], rev_channels[idx+1],
+                kernel_size=rev_kernel_sizes[idx],
+                dropout=dropout, act="aptx"))
+            last_channels = rev_channels[idx+1]
+            
+        self.conv_post = weight_norm(Conv1d(last_channels, self.post_n_fft + 2, 7, 1, padding=3))
 
     def forward(self, x):
         """
@@ -203,16 +226,20 @@ class AudioEncoder(nn.Module):
         Returns:
           - Spec, phase (iSTFT)
         """
+        x_p_s = x.size()
         # Project input to channel dimension channels[0]
-        x = self.proj(x)  # (batch, audio_len, channels[0])
+        x = self.proj(x.transpose(1,2))  # (batch, audio_len, channels[0])
         # Permute to (batch, channels[0], mel_len) for 1D convolutions.
         x = x.permute(0, 2, 1)
 
-        x_mask = None
+        
+        x_mask = torch.zeros((1, 1, 1), device=x.device).bool()
 
         # Pass through the encoder blocks
-        for block in self.encoder_blocks:
-            x = block(x, x_mask=x_mask)
+        # ---------- encoder ----------
+        for res, down in zip(self.enc_blocks, self.enc_down):
+            x = res(x, x_mask=x_mask)
+            x = down(x)
 
         # Permute back to (batch, mel_len, latent_dim)
         x = x.permute(0, 2, 1)
@@ -222,9 +249,14 @@ class AudioEncoder(nn.Module):
         # Permute for the decoder
         x = x.permute(0, 2, 1)
 
-        # Pass through the decoder blocks
-        for block in self.decoder_blocks:
-            x = block(x, x_mask=x_mask)
+
+        # ---------- decoder ----------
+        for up, res in zip(self.dec_up, self.dec_blocks):
+            x = up(x)
+            x = res(x, x_mask=x_mask)
+
+
+       # print("mysize: ",x.size(), x_p_s)
 
 
         return self.to_audio(x)
@@ -247,7 +279,20 @@ class Generator(torch.nn.Module):
         self.h = h
         self.num_kernels = len(h.resblock_kernel_sizes)
         self.num_upsamples = len(h.upsample_rates)
-        self.conv_pre = weight_norm(Conv1d(h.num_mels, h.upsample_initial_channel, 7, 1, padding=3))
+        if hasattr(h, "proj_type"):
+            self.proj_type = h.proj_type
+        else:
+            self.proj_type = "simple"
+
+        if self.proj_type == "simple":
+            self.conv_pre = weight_norm(Conv1d(h.num_mels, h.upsample_initial_channel, 7, 1, padding=3))
+        elif self.proj_type == "grouped":
+            self.conv_pre_dense = weight_norm(Conv1d(h.num_mels, h.upsample_initial_channel // 2, 7, 1, padding=3))
+            self.conv_pre_grouped = weight_norm(Conv1d(h.num_mels, h.upsample_initial_channel // 2, 7, 1, groups=4, padding=3))
+        else:
+            raise RuntimeError(f"Unknown projection type {self.proj_type}, options are either simple or grouped")
+
+        print(f"Proj type: {self.proj_type}")
         resblock = ResBlock1 if h.resblock == '1' else ResBlock2
 
         self.ups = nn.ModuleList()
@@ -268,12 +313,20 @@ class Generator(torch.nn.Module):
         self.post_n_fft = h.gen_istft_n_fft
         self.snake_post = Snake1d(ch)
         self.conv_post = weight_norm(Conv1d(ch, self.post_n_fft + 2, 7, 1, padding=3))
+        
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
         self.reflection_pad = torch.nn.ReflectionPad1d((1, 0))
 
     def forward(self, x):
-        x = self.conv_pre(x)
+        
+        if self.proj_type == "simple":
+            x = self.conv_pre(x)
+        else:
+            x1 = self.conv_pre_dense(x)
+            x2 = self.conv_pre_grouped(x)
+            x = torch.cat((x1, x2), dim=1)
+            
         for i in range(self.num_upsamples):
             x = self.ups_snakes[i](x)
             x = self.ups[i](x)

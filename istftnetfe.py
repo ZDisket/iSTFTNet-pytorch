@@ -36,8 +36,8 @@ class ISTFTNetFE(torch.nn.Module):
             
         return y_g_hat
         
-    def export_ts(self, out_foldername, sampling_rate, ex_devices = ["cuda", "cpu"]):
-        dummy_mel = torch.randn((1, 88, 600)) # create dummy mel input
+    def export_ts(self, out_foldername, sampling_rate, ex_devices = ["cuda", "cpu"], mel_channels=160):
+        dummy_mel = torch.randn((1, mel_channels, 600)) # create dummy mel input
         for dev in ex_devices:
             self.stft = self.stft.to(dev)
             self.stft.window = self.stft.window.to(dev)

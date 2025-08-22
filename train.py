@@ -19,7 +19,7 @@ from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator,
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint, save_ts_gen
 from stft import TorchSTFT
 from torch.cuda.amp import autocast, GradScaler
-
+from tqdm import tqdm
 torch.backends.cudnn.benchmark = False
 
 
@@ -116,7 +116,7 @@ def train(rank, a, h):
 
         sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
 
-    scaler = GradScaler(enabled=h.fp16_run)
+    scaler = GradScaler(enabled=False)
     generator.train()
     mpd.train()
     msd.train()
@@ -128,7 +128,7 @@ def train(rank, a, h):
         if h.num_gpus > 1:
             train_sampler.set_epoch(epoch)
 
-        for i, batch in enumerate(train_loader):
+        for i, batch in tqdm(enumerate(train_loader)):
             if rank == 0:
                 start_b = time.time()
             x, y, _, y_mel = batch
@@ -137,7 +137,7 @@ def train(rank, a, h):
             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
             y = y.unsqueeze(1)
             # y_g_hat = generator(x)
-            with autocast(enabled=h.fp16_run):
+            with autocast(enabled=h.fp16_run, dtype=torch.bfloat16):
                 spec, phase = generator(x)
                 spec, phase = spec.to(device), phase.to(device)
                 y_g_hat = stft.inverse(spec, phase)
@@ -168,7 +168,7 @@ def train(rank, a, h):
             # L1 Mel-Spectrogram Loss
             loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
 
-            with autocast(enabled=h.fp16_run):
+            with autocast(enabled=h.fp16_run, dtype=torch.bfloat16):
                 y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
                 y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
 
@@ -210,7 +210,8 @@ def train(rank, a, h):
                     save_ts_gen(ts_checkpoint_path,
                                 generator.module if h.num_gpus > 1 else generator,
                                 stft,
-                                h.sampling_rate)
+                                h.sampling_rate,
+                                h.num_mels)
 
                 # Tensorboard summary logging
                 if steps % a.summary_interval == 0:
@@ -227,7 +228,6 @@ def train(rank, a, h):
                             x, y, _, y_mel = batch
                             # y_g_hat = generator(x.to(device))
                             spec, phase = generator(x.to(device))
-
                             y_g_hat = stft.inverse(spec, phase)
 
                             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
@@ -298,7 +298,7 @@ def main():
     h = AttrDict(json_config)
     build_env(a.config, 'config.json', a.checkpoint_path)
 
-    torch.manual_seed(h.seed)
+    #torch.manual_seed(h.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(h.seed)
         h.num_gpus = torch.cuda.device_count()

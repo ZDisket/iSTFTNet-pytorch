@@ -56,12 +56,12 @@ def scan_checkpoint(cp_dir, prefix):
         return None
     return sorted(cp_list)[-1]
 
-def save_ts_gen(folpath, gen, g_stft, sr):
+def save_ts_gen(folpath, gen, g_stft, sr, mel_channels):
   device_before = next(gen.parameters()).device
   print(f"Exporting TorchScript generator to {folpath}")
   with torch.no_grad():
     g_fe = ISTFTNetFE(gen, g_stft)
-    g_fe.export_ts(folpath, sr)
+    g_fe.export_ts(folpath, sr, mel_channels=mel_channels)
   
   # return the gen and stft to their devices to avoid errors at next iter
   gen = gen.to(device_before)

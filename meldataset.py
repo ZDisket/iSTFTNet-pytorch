@@ -1,5 +1,7 @@
 import math
 import os
+#os.environ["LIBROSA_AUDIOREAD_BACKEND"] = "audioread"
+
 import random
 import torch
 import torch.utils.data
@@ -8,18 +10,32 @@ from librosa.util import normalize
 from scipy.io.wavfile import read
 from librosa.filters import mel as librosa_mel_fn
 import soundfile as sf
+import librosa
 MAX_WAV_VALUE = 32768.0
 import sklearn
 import skimage
 import skimage.filters
 import librosa
+
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="librosa.util.decorators")
+
+
 def pad_to(in_tens,tgt_size):
   pad_v = torch.zeros([tgt_size - in_tens.size(0)],dtype=in_tens.dtype)
   return torch.cat((in_tens,pad_v))
 
 
 def load_wav(full_path):
-    data, sampling_rate = sf.read(full_path)
+    data, sampling_rate = librosa.load(full_path, sr=None)  # sr=None preserves original sampling rate
+    
+    # Check if data array is empty or has fewer than 16,000 samples
+    if data.size == 0:
+        raise ValueError("Audio file is empty")
+    if len(data) < 16000:
+        raise ValueError("Audio has fewer than 16,000 samples")
+    
     return data, sampling_rate
 
 
@@ -54,11 +70,6 @@ hann_window = {}
 
 
 def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False):
-    if torch.min(y) < -1.:
-        print('min value is ', torch.min(y))
-    if torch.max(y) > 1.:
-        print('max value is ', torch.max(y))
-
     global mel_basis, hann_window
     if fmax not in mel_basis:
         mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
@@ -150,8 +161,8 @@ class MelDataset(torch.utils.data.Dataset):
             except KeyboardInterrupt:
                 raise ValueError("Keyboard interrupt...")
                 return None
-            except:
-                print(f"Could not open file {filename}")
+            except Exception as e:
+                print(f"Could not open file {filename} : {str(e)}")
                 self.bad_indexes.append(index)
                 return self.__getitem__(index + 1)
                 
@@ -188,10 +199,14 @@ class MelDataset(torch.utils.data.Dataset):
                     skimage.filters.gaussian(mel.squeeze().cpu().numpy(), 
                                              sigma=self.blur_sigma, channel_axis=0)).unsqueeze(0)
         else:
-            mel = np.load(
-                os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
+            try:
+                mel = np.load(
+                    os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
+            except FileNotFoundError:
+                self.bad_indexes.append(index)
+                return self.__getitem__(index + 1)
 
-            mel = torch.from_numpy(mel)
+            mel = torch.from_numpy(mel).transpose(0,1)
             
             if torch.isnan(mel).any():
                 raise ValueError(f"NaN in mel {filename}")
@@ -375,12 +390,13 @@ class AudioDataset(torch.utils.data.Dataset):
         # --- Calculate Mel Spectrogram for Loss ---
         # Use the final audio segment 'segment' as input
         # The mel_spectrogram function expects shape [..., time] -> [1, segment_size] is correct
+       # print("mel a ",segment.size())
         mel_loss = mel_spectrogram(segment, self.n_fft, self.num_mels,
                                    self.sampling_rate, self.hop_size, self.win_size,
                                    self.fmin, self.fmax_loss, # Use fmax_loss here
                                    center=False)
         # mel_loss shape: [1, num_mels, time_frames]
-
+        
         # --- Prepare Return Values ---
         # Audio segment (input for autoencoder), remove channel dim -> [segment_size]
         audio_ret = segment.squeeze(0)
